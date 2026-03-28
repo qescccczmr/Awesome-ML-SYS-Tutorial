@@ -1,0 +1,20 @@
+# Build artifacts
+build/
+cmake-build-*/
+*.o
+*.ptx
+*.cubin
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Performance data
+*.csv
+*.nsys-rep
+*.ncu-rep
+
+# Temporary files
+*.log
