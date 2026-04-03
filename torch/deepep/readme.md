@@ -19,11 +19,11 @@
 
 ### 节点内通信：NVLink vs PCIe
 
-**NVLink** 是 NVIDIA 的专有高速互联技术。在 H800 服务器中，8 张 GPU 通过 NVSwitch 全连接，任意两个 GPU 之间的单向带宽约 **450 GB/s**（NVLink 4.0）。从软件视角看，NVLink 让 GPU-A 可以直接读写 GPU-B 的显存，就像访问本地内存一样——只需要对方的虚拟地址（通过 CUDA IPC 机制在初始化时交换），发起 `cudaMemcpyPeer` 或在 kernel 里直接对该地址执行 load/store 指令即可。
+**NVLink** 是 NVIDIA 的专有高速互联技术。在 H800 服务器中，8 张 GPU 通过 NVSwitch 全连接，任意两个 GPU 之间的单向带宽约 200 GB/s（NVLink 4.0，出口限制版本）。作为对比，H100 的 NVLink 单向带宽约 **450 GB/s**。从软件视角看，NVLink 让 GPU-A 可以直接读写 GPU-B 的显存，就像访问本地内存一样——只需要对方的虚拟地址（通过 CUDA IPC 机制在初始化时交换），发起 `cudaMemcpyPeer` 或在 kernel 里直接对该地址执行 load/store 指令即可。
 
 NVLink 的延迟极低（几微秒），带宽极高，是节点内通信的首选。但它有一个严格的约束：**只能在同一台物理机器的 GPU 之间使用**。一旦跨机器，NVLink 就失效了。
 
-**PCIe** 是通用的设备互联总线。当两个 GPU 在同一台机器但没有 NVLink 连接时（比如某些 4 卡服务器配置），数据需要经过 PCIe → CPU 内存 → PCIe 的路径中转。PCIe 4.0 x16 的单向带宽约 **32 GB/s**，比 NVLink 慢了一个数量级，而且 CPU 内存中转带来了额外的延迟和 CPU 开销。
+**PCIe** 是通用的设备互联总线。当两个 GPU 在同一台机器但没有 NVLink 连接时（比如某些 4 卡服务器配置），数据需要经过 PCIe → CPU 内存 → PCIe 的路径中转。H800 使用 PCIe 5.0，单向带宽约 64 GB/s（双向 128 GB/s），比 NVLink 慢了一个数量级，而且 CPU 内存中转带来了额外的延迟和 CPU 开销。
 
 类比一下：NVLink 就像两个房间之间的直通门，PCIe 则像需要经过楼道和楼梯的绕行路径。对于 MoE 的 All-to-All 通信（数据量大、频繁），PCIe 的性能是不够的，这也是为什么高性能训练/推理集群都会优先选择 NVLink 全连接的配置。
 
@@ -42,7 +42,82 @@ RDMA 的编程模型基于 **ibverbs API**（`libibverbs`）。核心概念包�
 3. **RDMA Write**：单向写操作，发送方直接把数据写到接收方的指定地址，接收方无需主动参与。EP 场景下主要用 RDMA Write，因为路由信息在发送前就已确定。
 
 关于 RDMA 的详细机制，可以参考[RDMA 权重传输文章](../../rlhf/sys-design/readme-5.md)。这里只需要记住一个结论：**RDMA 通过内核旁路和零拷贝，把跨节点通信的 CPU 开销降到了最低，但 GPU 端仍需要参与「发起 WR」和「轮询 CQ」这两个动作**——这正是 DeepEP Low SM Mode 要优化的核心问题。
+### NVSHMEM 与 IBGDA：GPU 自主发起 RDMA 的关键基础设施
+NVSHMEM 是什么
 
+NVSHMEM 是 NVIDIA 基于 OpenSHMEM 标准实现的 GPU 集群通信库。与 NCCL 面向集合通信（AllReduce、AlltoAll 等）不同，NVSHMEM 提供的是对称内存 + 单边通信的编程模型：
+
+**对称内存（Symmetric Memory**： 所有参与通信的 GPU（在 NVSHMEM 中称为 PE，Processing Element）分配相同大小的内存区域，这些区域的虚拟地址在所有 PE 上是一致的（或至少可通过简单的 base + offset 映射到远端地址）。这意味着 GPU kernel 内部可以直接通过 PE 编号和偏移量计算出远端地址，而无需提前交换指针。
+
+**单边通信（One-sided Communication）**： NVSHMEM 提供 nvshmem_put / nvshmem_get 系列 API，允许一个 GPU 直接向另一个 GPU 的对称内存写入或读取数据，无需对方主动参与。这和 MPI 的 MPI_Send/MPI_Recv（双边通信）有本质区别——接收方甚至不知道什么时候被写了数据，需要通过 flag 或 barrier 来同步。
+
+**IBGDA：让 GPU 绕过 CPU 直接操作 NIC**
+传统的 RDMA 编程（基于 libibverbs）中，即使数据路径绕过了 CPU（GPU-Direct RDMA），控制路径仍然需要 CPU 参与：CPU 线程调用 ibv_post_send() 来提交 Work Request，调用 ibv_poll_cq() 来轮询完成。这意味着每次通信都需要一次 CPU-GPU 同步——CPU 等 GPU 准备好数据，然后发起 RDMA，或者 GPU 等 CPU 发起的 RDMA 完成。
+
+**IBGDA（InfiniBand GPU Direct Async）**彻底消除了这个瓶颈。它将 NIC 的 Work Queue（WQ）和 Completion Queue（CQ）**映射到 GPU 可访问的地址空间**，使得 GPU CUDA kernel 内的线程可以直接：
+
+向 NIC 的 Send Queue 写入 Work Request（通过 st.global 指令写 doorbell 寄存器）
+轮询 NIC 的 Completion Queue 检查完成状态（通过 ld.global 指令读 CQ 条目）
+整个通信的控制平面和数据平面都在 GPU 侧完成，CPU 完全不参与 hot path。
+**DeepEP 中的 NVSHMEM 配置** 
+从 buffer.py 的初始化代码可以看到 DeepEP 对 NVSHMEM 的精细配置：
+
+```python
+# 启用 IBGDA，允许 GPU 直接操作 NIC
+os.environ['NVSHMEM_IB_ENABLE_IBGDA'] = '1'
+
+# 每个 PE（GPU）到其他每个 PE 建立的 RC QP 数量
+# Low-latency 模式要求此值等于本地 expert 数量
+os.environ['NVSHMEM_IBGDA_NUM_RC_PER_PE'] = f'{num_qps_per_rank}'
+
+# QP 深度（每个 QP 能容纳的未完成 WR 数量）
+# 必须满足 >= (num_max_dispatch_tokens_per_rank + 1) * 2
+# 以避免运行时 WQ slot 检查开销
+self.nvshmem_qp_depth = int(os.environ.get('NVSHMEM_QP_DEPTH', '1024'))
+
+# 控制是否允许 NVLink 用于 NVSHMEM 的节点内通信
+# 关闭时，即使节点内也走 RDMA（某些 overlap 场景需要）
+os.environ['NVSHMEM_DISABLE_P2P'] = '0' if allow_nvlink_for_low_latency_mode else '1'
+
+# 禁用 NVLink SHArP（多播），减少不必要的资源占用
+os.environ['NVSHMEM_DISABLE_NVLS'] = '1'
+
+# NVSHMEM 初始化至少需要 256 MiB GPU 内存
+# 这里设为 512 MiB (2^29) 的粒度
+os.environ['NVSHMEM_CUMEM_GRANULARITY'] = f'{2 ** 29}'
+
+# 减少 GPU 内存占用：限制 team 数量
+os.environ['NVSHMEM_MAX_TEAMS'] = '7'
+```
+**NVSHMEM 的初始化同步**
+NVSHMEM 要求所有 PE 用同一个 unique ID 来建立连接。DeepEP 的处理方式是（第 119-128 行）：
+
+```python
+# 只有 root rank 生成 unique ID
+if (low_latency_mode and self.rank == 0) or \
+   (not low_latency_mode and self.runtime.get_rdma_rank() == 0):
+    root_unique_id = self.runtime.get_local_nvshmem_unique_id()
+
+# 所有 rank 通过 all_gather 获取 root 的 unique ID
+nvshmem_unique_ids = all_gather_object(root_unique_id)
+root_unique_id = nvshmem_unique_ids[
+    0 if low_latency_mode else self.runtime.get_root_rdma_rank(True)
+]
+```
+注意这里的区别：Low-latency 模式使用 rank 0 作为 root（因为所有 rank 都参与 NVSHMEM），而 Normal Mode 只有跨节点的 RDMA rank 参与 NVSHMEM 初始化，所以使用 RDMA root rank。
+
+**NVSHMEM 对 DeepEP 两种模式的意义**
+**Normal Mode（高吞吐）**： 节点间通信通过 NVSHMEM 的 IBGDA 通道发起 RDMA，GPU kernel 中的多个 CTA 并发调用 NVSHMEM put 操作，充分利用多 QP 打满 IB 带宽。
+
+**Low SM Mode（低延迟）**： 同样基于 NVSHMEM IBGDA，但只使用 1 个 CTA 内的少量 warp。每个 warp 负责向特定的远端 PE 发起 put 操作和轮询完成状态。由于 IBGDA 让这些操作的 SM 开销极小（大部分时间 NIC DMA 引擎在工作），1-2 个 SM 就足以管理全部跨节点通信。
+
+QP 深度与正确性保证
+DeepEP 在 low_latency_dispatch 中有一个关键断言（第 546 行）
+
+```python
+assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
+```
+这是因为每个 token 的 dispatch 需要提交一个 RDMA write WR，如果 QP 深度不够，未完成的 WR 会堆满 Send Queue，导致新的 WR 无法入队。乘以 2 是因为 dispatch 和 combine 各需要一组 WR slot。DeepEP 通过确保 QP 深度始终充足，跳过了运行时的 WQ slot 可用性检查，进一步降低延迟。
 ### NCCL 的通信抽象：为什么需要绕过它
 
 NCCL（NVIDIA Collective Communications Library）是 NVIDIA 提供的集合通信库，封装了 AllReduce、AllGather、AlltoAll 等操作。NCCL 的价值在于：
@@ -142,13 +217,48 @@ buffer = Buffer(
     group=process_group,
     num_rdma_bytes=1_000_000_000,  # 预分配 1GB RDMA buffer
     low_latency_mode=True,          # 启用 Low SM Mode
-    num_qps_per_rank=256            # 每个 rank 256 个 QP（对应 256 个 expert）
+    num_qps_per_rank=num_local_experts            #本 rank 负责的 expert 数量），默认值为 24
 )
 
 # 每次 MoE forward
-layout = buffer.get_dispatch_layout(topk_indices, topk_weights)
-recv_tokens, handle, event = buffer.dispatch(tokens, layout)
-# event 是一个 CUDA event，compute stream 可以 wait 它实现 overlap
+# Normal Mode（高吞吐，prefill/训练）
+buffer = Buffer(group=process_group, num_nvl_bytes=..., num_rdma_bytes=...)
+
+num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, layout_event = \
+    buffer.get_dispatch_layout(topk_idx, num_experts)
+
+recv_x, recv_topk_idx, recv_topk_weights, num_recv_per_expert, handle, dispatch_event = \
+    buffer.dispatch(x, num_tokens_per_rank=num_tokens_per_rank,
+                    num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+                    is_token_in_rank=is_token_in_rank,
+                    num_tokens_per_expert=num_tokens_per_expert,
+                    topk_idx=topk_idx, topk_weights=topk_weights)
+
+expert_output = run_expert_gemm(recv_x)
+
+combined_x, combined_weights, combine_event = buffer.combine(expert_output, handle)
+
+
+# Low SM Mode（低延迟，decode）
+buffer_ll = Buffer(group=process_group, num_rdma_bytes=...,
+                   low_latency_mode=True, num_qps_per_rank=num_local_experts)
+
+recv_x, recv_count, handle, event, hook = \
+    buffer_ll.low_latency_dispatch(x, topk_idx,
+                                   num_max_dispatch_tokens_per_rank=max_tokens,
+                                   num_experts=num_experts,
+                                   use_fp8=True)
+
+expert_output = run_expert_gemm(recv_x, recv_count)
+
+combined_x, combine_event, combine_hook = \
+    buffer_ll.low_latency_combine(expert_output, topk_idx, topk_weights, handle)
+Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor],  # recv_x
+      Optional[torch.Tensor],   # recv_topk_idx
+      Optional[torch.Tensor],   # recv_topk_weights
+      List[int],                 # num_recv_tokens_per_expert_list
+      Tuple,                     # handle
+      EventOverlap]              # event# event 是一个 CUDA event，compute stream 可以 wait 它实现 overlap
 
 expert_outputs = run_expert_gemm(recv_tokens)
 
@@ -190,8 +300,8 @@ NCCL 解决的是「通用集合通信」的问题：支持任意 rank 数量、
 
 | 维度 | NCCL AlltoAll | DeepEP Normal Mode | DeepEP Low SM Mode |
 |---|---|---|---|
-| **数据路径（节点间）** | GPU → NCCL proxy → RDMA → 目标 GPU | GPU kernel → RDMA → 目标 GPU | CPU → RDMA → 目标 GPU |
-| **WR 发起方** | NCCL proxy（CPU/GPU混合） | GPU kernel（doorbell 写） | **CPU 线程（ibv_post_send）** |
+| **数据路径（节点间）** | GPU → NCCL proxy → RDMA → 目标 GPU | GPU kernel → RDMA → 目标 GPU | GPU persistent warp → NVSHMEM IBGDA → RDMA → 目标 GPU |
+| **WR 发起方** | NCCL proxy（CPU/GPU混合） | GPU kernel（NVSHMEM IBGDA）| **GPU persistent warp（NVSHMEM IBGDA** |
 | **路由元数据** | 需要先 AlltoAll 交换 count | 由 Python 层计算并传入 | 同 Normal Mode |
 | **完成检测** | Persistent kernel 轮询 CQ | 多 CTA 轮询 CQ | **单 CTA warp 轮询** |
 | **SM 占用** | 16～32 | 8～20 | **1～2** |
@@ -237,7 +347,7 @@ RDMA 要求参与通信的内存必须注册为 Memory Region（通过 `ibv_reg_
 - **CPU 提交**：调用 `ibv_post_send(qp, &wr, ...)`，CPU 把 WR 写进 NIC 的 SQ。优点是不占用 GPU SM，缺点是需要 CPU-GPU 同步（CPU 需要等 GPU kernel 准备好数据、获取数据地址）
 - **GPU 提交**：GPU kernel 内部通过 `st.global` 指令写 NIC 的 doorbell 寄存器（映射到 GPU 地址空间）。优点是 GPU 可以自主发起通信、无需等 CPU，缺点是消耗 SM 周期
 
-Normal Mode 选择了 GPU 提交（更低延迟），代价是 SM 占用。Low SM Mode 选择了 CPU 提交（0 SM 占用），代价是需要精确协调 CPU 和 GPU 的执行时序——这也是 Low SM Mode 实现复杂度更高的原因之一。
+Normal Mode 和 Low SM Mode 都选择了 GPU 提交（通过 NVSHMEM IBGDA）。区别在于：Normal Mode 使用多个 CTA（8-20 SM）来并发发起大量 RDMA 操作以打满带宽；Low SM Mode 只使用 1 个 CTA 内的少量 warp 来发起 RDMA 操作，因为 decode 场景的数据量小，不需要高并发就能满足带宽需求。Low SM Mode 复杂度更高的原因在于 persistent warp 需要在极少资源下同时完成发起通信和轮询完成两个任务的交替调度。
 
 **约束 3：完成检测也有两种方式**
 
@@ -267,7 +377,7 @@ Normal Mode 的问题已经很清楚了：SM 占用高，是因为 GPU kernel �
 
 **中间方案（减少 CTA 数量）**：直接把 Normal Mode 的 CTA 数量砍掉，从 64 个降到 4 个。这会降低 SM 占用，但问题是：CTA 是 CUDA 的调度单位，GEMM kernel 的 register 和 shared memory 需求会把 SM 占满，调度器无法在同一个 SM 上同时跑通信 CTA 和 GEMM CTA。所以即便只有 4 个 CTA，这 4 个 SM 对 GEMM 而言依然是不可用的。
 
-**最终方案（Persistent Warp Group）**：把通信管理的粒度从 CTA 降到 warp。**只启动 1 个 CTA，包含 2～4 个 warp**，这些 warp 常驻在 1 个 SM 上，以 warp 为粒度轮询 IB completion queue，负责把到达的数据从 staging buffer 搬到 work buffer。剩余的 131 个 SM 完全空出来给 GEMM。
+**最终方案（Persistent Warp Group）**：不是轮询 IB CQ，而是轮询 NVSHMEM 在 GPU 显存中维护的 completion flag/counter。IBGDA 的 completion 通知也是通过 GPU 可见的内存标记完成的，不是传统的 CQ polling。
 
 为什么 warp 粒度能解决 CTA 粒度解决不了的问题？因为一个 SM 上可以同时驻留多个 warp（warp-level time-sharing），GEMM 的 warp 和通信的 warp 可以共享同一个 SM 的执行单元——只要通信 warp 大多数时间在等待（轮询 flag），它占用的执行时间极少，对 GEMM warp 的干扰可以忽略不计。
 
@@ -275,9 +385,9 @@ Normal Mode 的问题已经很清楚了：SM 占用高，是因为 GPU kernel �
 
 Low SM Mode 下，数据传输的控制权从 GPU SM 移交给了 CPU 和 NIC。整个流程分四步：
 
-**第一步：CPU 发起 RDMA Send WR（costs 0 SM）**
+**GPU Persistent Warp 通过 NVSHMEM IBGDA 发起 RDMA 操作（costs ~0 额外 SM）**
 
-发送方的 CPU 线程（不是 GPU kernel）调用 `ibv_post_send`，把 RDMA write 的 Work Request 写进 NIC 的 Send Queue。WR 里包含：源 GPU buffer 的 DMA 地址、目标 GPU buffer 的 remote key（rkey）和地址、传输大小。这一步完全由 CPU 完成，不消耗任何 GPU SM。
+发送方 GPU 上的 persistent warp 通过 NVSHMEM 的 GPU-side put API（底层走 IBGDA 通道）直接向 NIC 提交 RDMA write 请求。整个过程不需要 CPU 参与，由 persistent warp 自主完成。由于 IBGDA 允许 GPU 线程直接写 NIC 的 WQ（Work Queue），这个操作的 SM 时间开销极小。
 
 **第二步：NIC 自主完成 GPU-to-GPU DMA（costs 0 SM）**
 
@@ -295,7 +405,7 @@ NIC 从 SQ 取出 WR，通过 GPU-Direct RDMA 直接从发送方 GPU 显存读�
 
 一个自然的问题：NIC 为什么不直接写到 work buffer，而要先写到 staging buffer，再由 persistent warp 搬一次？
 
-原因是**网络包重排序（packet reordering）**。IB 网络在多路径或拥塞的情况下，同一消息的不同数据包可能乱序到达。如果 NIC 直接写到 work buffer，乱序数据会把 buffer 内容搞乱，GEMM 读到的就是错误数据。
+这是经典的 ping-pong 双缓冲设计：当前一次 dispatch 的结果还在被 GEMM 消费时，下一次 dispatch 可以写入另一个 buffer，实现通信和计算的流水线重叠。不是为了处理包乱序，而是为了避免写入和读取同一块内存的竞争。DeepEP 的 low-latency 模式维护了两个轮换使用的 buffer（ping-pong 双缓冲）。当 GEMM 正在消费 buffer A 中上一次 dispatch 的数据时，新一轮 dispatch 可以将数据写入 buffer B，避免读写冲突。正如文档所述："you cannot hold more than 2 low-latency kernels' result tensors at a single moment"。这个设计的核心目的是支持通信-计算流水线，而非处理网络包乱序（RC QP 已保证有序交付）
 
 Staging buffer 充当缓冲区：NIC 把数据写到 staging buffer 的固定位置（按预先协商的 rkey 和偏移），不管包怎么乱序，最终写完的 staging buffer 内容是正确的。Persistent warp 在确认 flag 置位（所有数据包到达并写入完毕）之后，才把数据从 staging buffer 搬到 work buffer。
 
@@ -401,9 +511,11 @@ DeepEP 的解法是：在 `Buffer` 初始化时一次性分配并注册足够大
 `buffer.dispatch()` 返回的 `event` 是一个 CUDA event，代表「dispatch 完成」的信号。调用方：
 
 ```python
-recv_tokens, handle, dispatch_event = buffer.dispatch(tokens, layout)
-torch.cuda.current_stream().wait_event(dispatch_event)  # 异步，不阻塞 CPU
-expert_outputs = run_expert_gemm(recv_tokens)
+buffer.low_latency_dispatch(x, topk_idx, ...)
+  └─ self.runtime.low_latency_dispatch(...)
+       └─ launch low_latency_dispatch_kernel()  # CUDA kernel, 1 SM
+            ├─ warp 0: nvshmem_putmem_nbi(...)   # IBGDA 发起 RDMA write
+            └─ warp 1: ld_acquire_sys_global()    # 轮询接收完成 flag
 ```
 
 `wait_event` 是异步的——它只在 GPU 的 compute stream 里插入一个「等待点」，CPU 继续运行。只有当 GPU 实际执行到这个等待点时，如果 dispatch_event 还没完成，compute stream 才会暂停。这让 overlap 的实现变得非常自然：两个 stream 各自推进，只在真正需要数据时才同步。
